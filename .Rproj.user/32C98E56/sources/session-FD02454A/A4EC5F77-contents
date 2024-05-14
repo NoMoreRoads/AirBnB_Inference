@@ -1,0 +1,69 @@
+## Importing City of Portland boundaries
+## ============================================================================
+
+temporary_file <- tempfile()
+temporary_file_2 <- tempfile()
+download.file("https://opendata.arcgis.com/api/v3/datasets/951488174bfe4275bbbd04421d7820f5_10/downloads/data?format=shp&spatialRefId=3857&where=1%3D1", temporary_file)
+unzip(temporary_file, exdir = temporary_file_2)
+PDX_boundary <- st_read(paste0(temporary_file_2, "/City_Boundaries.shp"))[35,] %>%
+  st_transform(4269) %>%
+  st_make_valid()
+unlink(temporary_file)
+unlink(temporary_file_2)
+
+## Importing census information for counties
+## ============================================================================
+county_census <- get_acs(geography = "county",
+                       state="OR",
+                       year = 2022,
+                       variables= c(medianhomevalue_c = "B25077_001",
+                                    medianrent_c = "B25058_001"),
+                       geometry = F,
+                       output = "wide") %>%
+  mutate(County2 = str_extract(NAME, "([:alpha:]*\\s?[:alpha:]*)\\sCounty", group = 1)) %>%
+  select(-ends_with("M"), -NAME, -GEOID)
+
+## Importing census information for block groups
+## ============================================================================
+census <- get_acs(geography = "cbg",
+        variables = c(housingunits = "B25001_001",
+                      medianhomevalue = "B25077_001",
+                      medianrent = "B25058_001"),
+        state = "OR",
+        year = 2022,
+        output = "wide",
+        survey = "acs5",
+        geometry = T) %>%
+  mutate(County1 = str_extract(NAME, "\\s([:alpha:]*)\\sCounty", group = 1)) %>%
+  st_make_valid() %>%
+  select(-ends_with("M")) %>%
+  mutate(initial_area = st_area(geometry) %>% as.numeric()) %>%
+  st_intersection(., PDX_boundary) %>%
+  mutate(modified_area = st_area(geometry) %>% as.numeric(),
+         pct_area_remaining = modified_area / initial_area,
+         housingunitsE = round(housingunitsE*pct_area_remaining) ) %>%
+  select(-c(GEOID, NAME, initial_area, CITYNAME, Shape_Leng, Shape_Area, AREA,
+            modified_area, pct_area_remaining, OBJECTID))
+
+## Filling in missing values with county values
+## ============================================================================
+imputed_census <- left_join(census, county_census, by = join_by(County1 == County2)) %>%
+  mutate(medianhomevalueE = coalesce(medianhomevalueE, medianhomevalue_cE),
+         medianrentE = coalesce(medianrentE, medianrent_cE) ) %>%
+  select(-c(medianhomevalue_cE, medianrent_cE, County1))
+
+## Counting listings by block group
+## ============================================================================
+census_final <- st_intersects(imputed_census, listings) %>%
+  lapply(., length) %>%
+  unlist() %>%
+  cbind.data.frame(., imputed_census) %>%
+  rename(listings_num = ".") %>%
+  select(-geometry)
+
+## Creating point representing Pioneer Courthouse Square as a rough measure of 
+## the city center
+## ============================================================================
+Pioneer_Square <- data.frame(45.5188803,-122.6818477) %>%
+  st_as_sf(., coords = c("X.122.6818477","X45.5188803")) %>%
+  st_set_crs(., 4326)

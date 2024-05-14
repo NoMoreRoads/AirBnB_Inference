@@ -1,0 +1,176 @@
+## Load libraries 
+## ============================================================================
+
+library(tidyverse)
+library(sf)
+library(mapview)
+library(tidycensus)
+library(jsonlite)
+
+
+## Create vector to leverage Biketown URL pattern, make loading data from site
+## more efficient 
+## ============================================================================
+
+url_vector <- c()
+
+for (x in 1:12) {
+  month_num <- c(1:12) %>% as.character()
+  if (x<10) {
+    month_num[x] <- paste0("0", month_num[x])
+  }
+  url_vector[x] <- paste0("https://s3.amazonaws.com/biketown-tripdata-public/2019_", month_num[x], ".csv")
+}
+
+## Store each file separately (performance issues resulted from trying to do 
+## anything too clever here)
+## ============================================================================
+
+jan_data <- read.csv(url_vector[1])
+feb_data <- read.csv(url_vector[2])
+mar_data <- read.csv(url_vector[3])
+apr_data <- read.csv(url_vector[4])
+may_data <- read.csv(url_vector[5])
+jun_data <- read.csv(url_vector[6])
+jul_data <- read.csv(url_vector[7])
+aug_data <- read.csv(url_vector[8])
+sep_data <- read.csv(url_vector[9])
+oct_data <- read.csv(url_vector[10])
+nov_data <- read.csv(url_vector[11])
+dec_data <- read.csv(url_vector[12])
+
+## Bring all months together in single data frame 
+## ============================================================================
+FY2019_data <- bind_rows(jan_data, feb_data, mar_data, apr_data, may_data, 
+                         jun_data, jul_data, aug_data, sep_data, oct_data, 
+                         nov_data, dec_data)
+
+
+## Rectifying naming discrepancies between months, stripping data frame down to
+## only necessary columns 
+## ============================================================================
+
+FY2019_data_trip_starts <- FY2019_data %>% 
+  select(StartLatitude, StartLongitude, Start_Latitude, Start_Longitude) %>% 
+  filter( (is.na(StartLatitude) & is.na(Start_Latitude)) == F ) %>% 
+  mutate(StartLatitude = coalesce(StartLatitude, Start_Latitude), StartLongitude = coalesce(StartLongitude, Start_Longitude)) %>% 
+  select(1:3) %>% st_as_sf(., coords = c("StartLongitude", "StartLatitude")) %>% st_set_crs(4152) %>% st_transform(2913)
+
+
+
+## Accessing relevant variables from census data by census block group
+## ============================================================================
+
+Population_Frame <- get_acs(geography = "cbg",
+                            state = "OR",
+                            year = 2019,
+                            variables="B01001_001E" ,
+                            geometry = T,
+                            output = "tidy")  %>% st_set_crs(4152) %>% 
+                            st_transform(2913) %>% 
+                            rename(Raw_Population = estimate)
+
+bike_commute_rate <- get_acs(geography = "cbg",
+                            state = "OR",
+                            year = 2019,
+                            variables="B08301_018" ,
+                            output = "tidy") %>% rename(Bike_Commute_Rate = estimate) %>% select(GEOID, Bike_Commute_Rate)
+
+
+## Importing 2018 Biketown boundary, converting to a polygon
+## ============================================================================
+biketown_boundary_2018 <- st_read("./BIKETOWN 2018 Service Area") %>% 
+  st_transform(2913) %>% st_zm() %>% st_cast(., "POLYGON")
+
+
+## Downloading biketown station data
+## ============================================================================
+Station_Info <- fromJSON(txt="https://gbfs.lyft.com/gbfs/2.3/pdx/en/station_information.json", simplifyVector = T)[[1]][[1]] %>% 
+  select(lon, lat, capacity) %>% 
+  st_as_sf(., coords = c("lon", "lat")) %>% 
+  st_set_crs(4152) %>% 
+  st_transform(2913) %>%
+  st_intersection(., biketown_boundary_2018) %>%
+  select(capacity, geometry)
+
+## Creating a Pioneer Square point to base a remoteness measure off of
+## ============================================================================
+Pioneer_Square <- data.frame(45.5188803,-122.6818477) %>% 
+  st_as_sf(., coords = c("X.122.6818477","X45.5188803")) %>% 
+  st_set_crs(., 4152 ) %>% st_transform(2913)
+
+## Clipping block group data to the boundaries of the city, calculating the 
+## portion of the area of the block group remaining after the clip for later use
+## ============================================================================
+Clipped_Population_Frame <- Population_Frame %>%
+  mutate(Previous_Area = as.numeric(st_area(geometry))) %>%
+  st_intersection(., biketown_boundary_2018) %>%
+  mutate(New_Area = as.numeric(st_area(geometry)), 
+         Proportion_Left = New_Area/Previous_Area, 
+         Centerpoint = st_centroid(geometry), 
+         Remoteness = as.numeric(st_distance(Centerpoint, Pioneer_Square))) %>%
+  select(-c(NAME, variable, moe, OBJECTID, Shape_Leng, Centerpoint, Previous_Area))
+
+## Calculating number of trips that began in each block group
+## ============================================================================
+trip_nums <- st_intersects(Clipped_Population_Frame, FY2019_data_trip_starts) %>%
+  lapply(., length) %>% 
+  unlist()
+
+bgs_with_trips <- cbind.data.frame(Clipped_Population_Frame, trip_nums)
+
+## Adding the rest of the demographic data, adjusting values by the proportion 
+## of area leftover
+## ============================================================================
+adjusted_bgs <- bgs_with_trips %>% left_join(bike_commute_rate) %>% 
+  mutate(across(c(Raw_Population, Bike_Commute_Rate), function(x) round(x*Proportion_Left) )) %>% 
+  select(-Proportion_Left) %>% st_as_sf()
+
+## Calculating station capacity by block group
+## ============================================================================
+bgs_with_capacity <- st_intersection(adjusted_bgs, Station_Info) %>% 
+  group_by(across(-capacity)) %>% summarise(capacity_total = sum(capacity)) %>% 
+  ungroup() %>% st_drop_geometry() %>% select(-GEOID)
+
+## Checking assumptions of multiple linear regression for this data
+## ============================================================================
+
+# Checking trip nums against all other predictors
+pairs(bgs_with_capacity)
+
+# Taking logarithm of trip nums, as the variance of predictors tends to increase
+# as trip number increases
+modifications_1 <- bgs_with_capacity %>% mutate(trip_nums = log(trip_nums+1) )
+
+# Checking relationships again
+pairs(modifications_1)
+
+# Checking each predictors' residuals against the logarithm of trip nums to 
+# ensure that we now have a linear relationship
+lm(data = modifications_1, formula = trip_nums ~ capacity_total)$res %>% plot()
+lm(data = modifications_1, formula = trip_nums ~ Bike_Commute_Rate)$res %>% plot()
+lm(data = modifications_1, formula = trip_nums ~ Remoteness)$res %>% plot()
+lm(data = modifications_1, formula = trip_nums ~ New_Area)$res %>% plot()
+lm(data = modifications_1, formula = trip_nums ~ Raw_Population)$res %>% plot()
+
+lm(data = modifications_1, formula = trip_nums ~ capacity_total)$res %>% hist()
+lm(data = modifications_1, formula = trip_nums ~ Bike_Commute_Rate)$res %>% hist()
+lm(data = modifications_1, formula = trip_nums ~ Remoteness)$res %>% hist()
+lm(data = modifications_1, formula = trip_nums ~ New_Area)$res %>% hist()
+lm(data = modifications_1, formula = trip_nums ~ Raw_Population)$res %>% hist()
+
+# The odd departure from normality for the residuals of bike commute rate 
+# indicates that it may be beneficial to remove the variable entirely.
+
+modifications_2 <- modifications_1 %>% select(-Bike_Commute_Rate)
+
+# Checking for multicolinearity; none found
+cor(modifications_2)
+
+# We can see that our data comes from a left-skewed distribution but is 
+# relatively normal, and that it is homoskedastic as well
+lm(trip_nums~., data = modifications_2) %>% plot()
+
+## Fitting model and checking results
+## ===========================================================================
+lm(trip_nums~., data = modifications_2) %>% summary()
